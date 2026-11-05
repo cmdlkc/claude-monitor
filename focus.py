@@ -13,6 +13,8 @@ import time
 
 import comtypes.client
 
+from common import log_error
+
 k32 = ctypes.windll.kernel32
 user32 = ctypes.windll.user32
 k32.GetConsoleWindow.restype = ctypes.c_void_p
@@ -33,8 +35,11 @@ def raise_window(hwnd):
 
 
 def select_tab(marker):
-    comtypes.client.GetModule("UIAutomationCore.dll")
-    from comtypes.gen import UIAutomationClient as uia_mod
+    try:  # bundled with the packaged app; generated on first use otherwise
+        from comtypes.gen import UIAutomationClient as uia_mod
+    except ImportError:
+        comtypes.client.GetModule("UIAutomationCore.dll")
+        from comtypes.gen import UIAutomationClient as uia_mod
 
     uia = comtypes.client.CreateObject(uia_mod.CUIAutomation._reg_clsid_, interface=uia_mod.IUIAutomation)
     root = uia.GetRootElement()
@@ -80,8 +85,12 @@ def focus(pid):
     raise_window(ctypes.c_void_p(hwnd) if hwnd else None)
 
 
-if __name__ == "__main__":
+def run(args):
     try:
-        focus(int(sys.argv[1]))
+        focus(int(args[0]))
     except Exception:
-        pass
+        log_error("focus")
+
+
+if __name__ == "__main__":
+    run(sys.argv[1:])

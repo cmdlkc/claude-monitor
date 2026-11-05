@@ -21,9 +21,10 @@ from datetime import datetime, timezone
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import (QAction, QColor, QFont, QFontMetrics, QLinearGradient, QPainter,
                            QPainterPath, QPen, QRadialGradient)
-from PySide6.QtWidgets import QApplication, QMenu, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QWidget
 
-DATA_DIR = os.path.join(os.environ["LOCALAPPDATA"], "claude-monitor")
+from common import DATA_DIR, command
+
 STATUS_DIR = os.path.join(DATA_DIR, "status")
 TITLE_DIR = os.path.join(DATA_DIR, "titles")
 LIMITS = os.path.join(DATA_DIR, "limits.json")
@@ -53,8 +54,6 @@ ORDER = {"waiting": 0, "done": 1, "working": 2, "idle": 3}
 
 k32 = ctypes.windll.kernel32
 user32 = ctypes.windll.user32
-HERE = os.path.dirname(os.path.abspath(__file__))
-PYTHONW = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
 WORK_PERIOD = 1.0  # seconds per blink while working
 SPINNER = set("✳✶✻✽✢·◐◑◒◓* ")
 _titles = {}  # pid -> (fetched at, title)
@@ -196,6 +195,9 @@ class Overlay(QWidget):
             act.triggered.connect(fn)
             self.menu.addAction(act)
         self.menu.addSeparator()
+        uninstall_act = QAction("Uninstall…", self)
+        uninstall_act.triggered.connect(self.uninstall)
+        self.menu.addAction(uninstall_act)
         quit_act = QAction("Quit", self)
         quit_act.triggered.connect(QApplication.quit)
         self.menu.addAction(quit_act)
@@ -278,8 +280,7 @@ class Overlay(QWidget):
         s = next((s for s in self.sessions if s["session_id"] == sid), None)
         if s and s.get("pid"):
             user32.AllowSetForegroundWindow(-1)  # ASFW_ANY: let the helper raise the terminal
-            subprocess.Popen([PYTHONW, os.path.join(HERE, "focus.py"), str(s["pid"])],
-                             creationflags=0x08000000)
+            subprocess.Popen(command("focus", str(s["pid"])), creationflags=0x08000000)
 
     def ack(self, sid):
         for s in self.sessions:
@@ -310,6 +311,14 @@ class Overlay(QWidget):
                     pass
         self.poll()
         self.update()
+
+    def uninstall(self):
+        answer = QMessageBox.question(None, "Claude Monitor",
+                                      "Remove Claude Monitor's hooks and login item, and quit?")
+        if answer == QMessageBox.Yes:
+            import install
+            install.uninstall()
+            QApplication.quit()
 
     # ------------------------------------------------ mouse
     def mousePressEvent(self, e):
@@ -461,9 +470,13 @@ def single_instance():
     return k32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
 
 
-if __name__ == "__main__":
+def run():
     if single_instance():
         app = QApplication(sys.argv)
         w = Overlay()
         w.show()
         sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    run()

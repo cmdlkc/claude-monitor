@@ -9,7 +9,7 @@ import os
 import sys
 import time
 
-DATA_DIR = os.path.join(os.environ["LOCALAPPDATA"], "claude-monitor")
+from common import DATA_DIR, log_error
 
 
 def window(raw):
@@ -39,8 +39,12 @@ def main():
     os.replace(tmp, path)
 
 
-if __name__ == "__main__":
+def run():
     try:
         main()
     except Exception:
-        pass
+        log_error("statusline")
+
+
+if __name__ == "__main__":
+    run()

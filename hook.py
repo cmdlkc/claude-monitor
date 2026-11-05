@@ -12,10 +12,9 @@ import subprocess
 import sys
 import time
 
-DATA_DIR = os.path.join(os.environ["LOCALAPPDATA"], "claude-monitor")
+from common import DATA_DIR, command, log_error
+
 STATUS_DIR = os.path.join(DATA_DIR, "status")
-HERE = os.path.dirname(os.path.abspath(__file__))
-PYTHONW = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
 DETACHED = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED | NEW_GROUP | NO_WINDOW
 
 # Tools that stop and wait for the user before they run to completion.
@@ -81,8 +80,8 @@ def new_state(event, payload, current):
     return None
 
 
-def spawn(*args):
-    subprocess.Popen([PYTHONW, *args], creationflags=DETACHED, close_fds=True,
+def spawn(argv):
+    subprocess.Popen(argv, creationflags=DETACHED, close_fds=True,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -93,7 +92,7 @@ def main():
     if not session:
         return
     if event == "SessionStart":
-        spawn(os.path.join(HERE, "overlay.pyw"))  # single-instance: no-op if already open
+        spawn(command("overlay"))  # single-instance: no-op if already open
     os.makedirs(STATUS_DIR, exist_ok=True)
     path = os.path.join(STATUS_DIR, f"{session}.json")
 
@@ -135,9 +134,13 @@ def main():
     os.replace(tmp, path)
 
 
-if __name__ == "__main__":
+def run():
     try:
         main()
     except Exception:
-        pass
+        log_error("hook")
     sys.exit(0)
+
+
+if __name__ == "__main__":
+    run()
