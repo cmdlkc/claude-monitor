@@ -64,7 +64,11 @@ def new_state(event, payload, current):
     if event == "PermissionRequest":
         return "waiting"
     if event in ("PostToolUse", "PostToolUseFailure"):
-        return "working" if current == "waiting" else None
+        if payload.get("agent_id"):  # a subagent's tool: a background one must not relight the row
+            return "working" if current == "waiting" else None
+        # The main agent used a tool, so it is working, whatever an earlier (possibly
+        # stray mid-turn) Stop said. Already working: nothing to write.
+        return "working" if current != "working" else None
     if event == "Notification":
         ntype = payload.get("notification_type", "")
         msg = (payload.get("message") or "").lower()
