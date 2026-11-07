@@ -1,6 +1,7 @@
 """Install / uninstall the Claude monitor.
 
-  python install.py            add hooks to ~/.claude/settings.json, start overlay at login, launch it
+  python install.py            add hooks to ~/.claude/settings.json (and Antigravity's
+                               ~/.gemini/config/hooks.json), start overlay at login, launch it
   python install.py --remove   undo all of that
 
 The packaged app does the same via `Claude Monitor.exe install|uninstall`; installing
@@ -13,9 +14,14 @@ import shutil
 import subprocess
 import sys
 
-from common import FROZEN, HERE, command
+from common import DATA_DIR, FROZEN, HERE, command
 
 SETTINGS = os.path.expanduser("~/.claude/settings.json")
+GEMINI_DIR = os.path.expanduser("~/.gemini")
+AGY_HOOKS = os.path.join(GEMINI_DIR, "config", "hooks.json")
+AGY_HOOK_NAME = "claude-monitor"
+AGY_EVENTS = ("SessionStart", "PreInvocation", "Stop")
+AGY_WRAPPER = os.path.join(DATA_DIR, "agy-hook.cmd")
 APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "Programs", "Claude Monitor")
 EXE_NAME = "Claude Monitor.exe"
 STARTUP = os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs\Startup",
@@ -24,6 +30,7 @@ STARTUP = os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Pro
 EVENTS = {
     "SessionStart": None, "UserPromptSubmit": None, "PermissionRequest": None,
     "Notification": None, "Stop": None, "StopFailure": None, "SessionEnd": None,
+    "SubagentStart": None, "SubagentStop": None,
     "PreToolUse": "AskUserQuestion|ExitPlanMode",
     "PostToolUse": "*", "PostToolUseFailure": "*",
 }
@@ -91,6 +98,47 @@ def update_settings(add):
     return note
 
 
+def short_path(path):
+    """8.3 form of a path, so it has no spaces (falls back to the path itself)."""
+    buf = ctypes.create_unicode_buffer(1024)
+    return buf.value if ctypes.windll.kernel32.GetShortPathNameW(path, buf, 1024) else path
+
+
+def agy_wrapper_command():
+    """agy runs hooks as `cmd /c <command>` but escapes any quotes in it as \\", so the
+    command itself must be quote-free: point it at a .cmd that holds the quoted one."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(AGY_WRAPPER, "w", encoding="utf-8") as f:
+        f.write(f"@{shell_cmd(command('hook', 'agy'))} %*\n")
+    return short_path(AGY_WRAPPER)  # backslashes: cmd reads a leading C:/ as a switch
+
+
+def update_agy_hooks(add):
+    """Register (or remove) our named hook in Antigravity's shared hooks.json."""
+    if add and not os.path.isdir(GEMINI_DIR):
+        return  # Antigravity isn't installed
+    try:
+        with open(AGY_HOOKS, encoding="utf-8-sig") as f:
+            hooks = json.load(f)
+        shutil.copy(AGY_HOOKS, AGY_HOOKS + ".bak-monitor")
+    except FileNotFoundError:
+        hooks = {}
+    hooks.pop(AGY_HOOK_NAME, None)
+    if not add and os.path.exists(AGY_WRAPPER):
+        os.remove(AGY_WRAPPER)
+    if add:
+        wrapper = agy_wrapper_command()
+        hooks[AGY_HOOK_NAME] = {
+            event: [{"type": "command", "timeout": 10, "command": f"{wrapper} {event}"}]
+            for event in AGY_EVENTS
+        }
+    if not hooks and not os.path.exists(AGY_HOOKS):
+        return
+    os.makedirs(os.path.dirname(AGY_HOOKS), exist_ok=True)
+    with open(AGY_HOOKS, "w", encoding="utf-8") as f:
+        json.dump(hooks, f, indent=2)
+
+
 def installed_hook_command():
     """The hook command currently in settings.json if it is ours, else ''."""
     try:
@@ -120,21 +168,24 @@ def install():
         subprocess.Popen([os.path.join(APP_DIR, EXE_NAME), "install"], creationflags=0x00000008)
         return
     note = update_settings(add=True)
+    update_agy_hooks(add=True)
     overlay = command("overlay")
     with open(STARTUP, "w", encoding="utf-8") as f:
         args = " ".join(f'""{a}""' for a in overlay)
         f.write(f'CreateObject("WScript.Shell").Run "{args}", 0, False\n')
     subprocess.Popen(overlay, creationflags=0x00000008)  # DETACHED_PROCESS
     message("Claude Monitor is installed and will start at login.\n\n"
-            "Already-open Claude sessions pick up the hooks after a restart (or /hooks)." + note)
+            "Already-open Claude / Antigravity sessions pick up the hooks after a restart. "
+            "Codex needs no setup: it shows up as soon as it runs." + note)
 
 
 def uninstall():
     update_settings(add=False)
+    update_agy_hooks(add=False)
     if os.path.exists(STARTUP):
         os.remove(STARTUP)
     stop_other_instances()
-    text = "Removed Claude Monitor's hooks, status line and login item."
+    text = "Removed Claude Monitor's Claude / Antigravity hooks, status line and login item."
     if FROZEN:
         text += f"\n\nYou can now delete:\n{APP_DIR}"
     message(text)

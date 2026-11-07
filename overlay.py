@@ -1,11 +1,15 @@
-"""Always-on-top glass overlay showing every running Claude Code session.
+"""Always-on-top glass overlay showing every running Claude Code, Antigravity and Codex session.
 
-  green  -> Claude finished          (pulses 3x, stays lit until clicked)
-  yellow -> Claude is waiting on you (pulses 3x, stays lit until answered)
-  blue   -> working
+  green  -> finished          (pulses 3x, stays lit until clicked)
+  yellow -> waiting on you    (pulses 3x, stays lit until answered)
+  blink  -> working: orange for Claude, blue for Antigravity (agy), white for Codex
+  orange, hollow, slow blink -> turn finished but background commands or subagents still run
   grey   -> idle
 
-Also shows the 5-hour and 7-day plan limits (fed by statusline.py).
+The title names the active agents ("claude", "claude, agy, codex", ...). Below the rows
+are the 5-hour and 7-day plan limits: Claude's (fed by statusline.py) and, while Codex
+runs, Codex's (from its session logs), each bar in its agent's colour. Antigravity
+keeps no usage data on disk, so it has no limits block.
 Drag to move, click a row to acknowledge, right-click for options.
 """
 import ctypes
@@ -23,7 +27,8 @@ from PySide6.QtGui import (QAction, QColor, QFont, QFontMetrics, QLinearGradient
                            QPainterPath, QPen, QRadialGradient)
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QWidget
 
-from common import DATA_DIR, command
+import codex
+from common import DATA_DIR, background_work, command, log_error, process_table
 
 STATUS_DIR = os.path.join(DATA_DIR, "status")
 TITLE_DIR = os.path.join(DATA_DIR, "titles")
@@ -31,6 +36,7 @@ LIMITS = os.path.join(DATA_DIR, "limits.json")
 CONFIG = os.path.join(DATA_DIR, "overlay-config.json")
 
 POLL_MS = 500
+PROC_POLL = 2.0  # seconds between process-list scans (agy, Codex)
 PULSE_PERIOD = 0.75   # seconds per blink
 PULSES = 3
 
@@ -46,15 +52,22 @@ COLORS = {
     "done": QColor("#4FD1A1"),     # jade
     "waiting": QColor("#F2B23A"),  # amber
     "working": QColor("#E8833A"),  # orange, blinks while working
+    "background": QColor("#E8833A"),
     "idle": QColor("#8A8A96"),
 }
-LABELS = {"done": "done", "waiting": "needs you", "working": "working", "idle": "idle"}
-BAR_FILL = QColor("#E8833A")  # orange
-ORDER = {"waiting": 0, "done": 1, "working": 2, "idle": 3}
+LABELS = {"done": "done", "waiting": "needs you", "working": "working", "background": "background", "idle": "idle"}
+AGENTS = ("claude", "agy", "codex")  # title order
+AGENT_COLORS = {  # working blink and limit bars
+    "claude": QColor("#E8833A"),  # orange
+    "agy": QColor("#4C8DFF"),     # blue
+    "codex": QColor("#F2F2F2"),   # white
+}
+ORDER = {"waiting": 0, "done": 1, "working": 2, "background": 2, "idle": 3}
 
 k32 = ctypes.windll.kernel32
 user32 = ctypes.windll.user32
 WORK_PERIOD = 1.0  # seconds per blink while working
+BACKGROUND_PERIOD = 2.0  # slower blink while only background work runs
 SPINNER = set("✳✶✻✽✢·◐◑◒◓* ")
 _titles = {}  # pid -> (fetched at, title)
 
@@ -79,7 +92,7 @@ def console_title(pid):
         k32.GetConsoleTitleW(buf, 512)
         k32.FreeConsole()
         title = buf.value.lstrip("".join(SPINNER)).strip()
-        if title.lower() in ("claude code", "claude", "") or title.startswith("cm-focus-"):
+        if title.lower() in ("claude code", "claude", "agy", "antigravity", "codex", "") or title.startswith("cm-focus-"):
             title = ""
     _titles[pid] = (time.time(), title)
     return title
@@ -169,6 +182,12 @@ class Overlay(QWidget):
         self.acked = dict(self.cfg.get("acked", {}))
         self.sessions = []
         self.limits = None
+        self.agy_running = False
+        self.codex_running = False
+        self.codex_sessions = []
+        self.codex_limits = None
+        self.cleared = {}     # Codex session_id -> updated, hidden by "Clear finished"
+        self._proc_scan = 0.0
         self.pulse = {}       # session_id -> (alert key, start time)
         self.row_rects = []   # (QRectF, session_id)
         self.hover = None
@@ -203,7 +222,12 @@ class Overlay(QWidget):
         self.menu.addAction(quit_act)
 
         screen = QApplication.primaryScreen().availableGeometry()
-        self.move(self.cfg.get("x", screen.right() - WIDTH - 16), self.cfg.get("y", screen.top() + 60))
+        x, y = self.cfg.get("x", screen.right() - WIDTH - 16), self.cfg.get("y", screen.top() + 60)
+        # A saved spot on a monitor that is no longer attached would leave the overlay unreachable.
+        if not any(s.availableGeometry().contains(x + WIDTH // 2, y + BAR_H // 2)
+                   for s in QApplication.screens()):
+            x, y = screen.right() - WIDTH - 16, screen.top() + 60
+        self.move(x, y)
 
         self.anim_timer = QTimer(self, timeout=self.update)
         self.anim_timer.start(33)
@@ -214,6 +238,19 @@ class Overlay(QWidget):
     # ------------------------------------------------ data
     def poll(self):
         now = time.time()
+        procs = None
+        if now - self._proc_scan > PROC_POLL:
+            self._proc_scan = now
+            procs = process_table()
+            self.agy_running = any(name == "agy.exe" for _, name in procs.values())
+            self.codex_running = bool(codex.codex_pids(procs))
+            try:
+                self.codex_sessions = codex.sessions(procs, now)
+                # Keep the last limits seen: a log's recent tail may hold no token_count yet.
+                self.codex_limits = codex.limits(self.codex_sessions) or self.codex_limits
+            except Exception:  # an unexpected log format must not take the overlay down
+                log_error("codex")
+                self.codex_sessions = []
         sessions = []
         if os.path.isdir(STATUS_DIR):
             for name in os.listdir(STATUS_DIR):
@@ -234,6 +271,13 @@ class Overlay(QWidget):
                 s["_folder"] = os.path.basename(s.get("cwd", "").rstrip("\\/")) or "~"
                 s["_name"] = (console_title(s["pid"]) if s.get("pid") else "") or s["_folder"]
                 sessions.append(s)
+        for c in self.codex_sessions:
+            if self.cleared.get(c["session_id"]) == c["updated"]:
+                continue
+            s = dict(c)
+            s["_folder"] = os.path.basename(s["cwd"].rstrip("\\/")) or "~"
+            s["_name"] = console_title(s["pid"]) or s["_folder"]
+            sessions.append(s)
         sessions.sort(key=lambda s: (ORDER.get(s["state"], 9), s.get("cwd", "")))
 
         for s in sessions:
@@ -245,11 +289,29 @@ class Overlay(QWidget):
                 self.pulse.pop(s["session_id"], None)
 
         self.sessions = sessions
+        if procs is not None:
+            for s in sessions:
+                if s["state"] == "background" and not background_work(s.get("pid"), s, procs):
+                    self.finish_background(s, now)
         self.limits = read_json(LIMITS)
         self.resize(WIDTH, self.content_height())
         # Animate smoothly only while something is pulsing.
-        working = any(s["state"] == "working" for s in sessions)
+        working = any(s["state"] in ("working", "background") for s in sessions)
         self.anim_timer.setInterval(33 if working or self.any_pulsing() else 1000)
+
+    def finish_background(self, s, now):
+        """The last background job ended with no hook to report it: mark the session done."""
+        record = {k: v for k, v in s.items() if not k.startswith("_")}
+        record.update(state="done", updated=now, event="BackgroundDone")
+        try:
+            tmp = s["_path"] + ".overlay.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(record, f)
+            os.replace(tmp, s["_path"])
+        except OSError:
+            return
+        s.update(state="done", updated=now)
+        self.pulse[s["session_id"]] = (self.alert_key(s), now)
 
     def alert_key(self, s):
         if s["state"] == "waiting":
@@ -272,8 +334,26 @@ class Overlay(QWidget):
         now = time.time()
         return any(now - start < PULSES * PULSE_PERIOD for _, start in self.pulse.values())
 
+    def active_agents(self):
+        """Agents with a session or a running process, in title order."""
+        found = {s.get("agent", "claude") for s in self.sessions}
+        if self.agy_running:
+            found.add("agy")
+        if self.codex_running:  # Codex writes no log before the first prompt
+            found.add("codex")
+        return [a for a in AGENTS if a in found] or ["claude"]
+
+    def limit_blocks(self):
+        """(agent, limits) to draw: Claude's always, the others' while they are active."""
+        blocks = [("claude", self.limits)]
+        if "codex" in self.active_agents() and self.codex_limits:
+            blocks.append(("codex", self.codex_limits))
+        return blocks
+
     def content_height(self):
-        return BAR_H + GAP + len(self.sessions) * ROW_H + 2 * GAP + 2 * LIMIT_H + PAD - 2
+        blocks = len(self.limit_blocks())
+        return (BAR_H + GAP + len(self.sessions) * ROW_H + 2 * GAP
+                + blocks * 2 * LIMIT_H + (blocks - 1) * GAP + PAD - 2)
 
     # ------------------------------------------------ actions
     def open_terminal(self, sid):
@@ -304,11 +384,15 @@ class Overlay(QWidget):
 
     def clear_finished(self):
         for s in self.sessions:
-            if s["state"] in ("done", "idle"):
-                try:
-                    os.remove(s["_path"])
-                except OSError:
-                    pass
+            if s["state"] not in ("done", "idle"):
+                continue
+            if s.get("agent") == "codex":  # the log is Codex's own: hide the row, never delete it
+                self.cleared[s["session_id"]] = s["updated"]
+                continue
+            try:
+                os.remove(s["_path"])
+            except OSError:
+                pass
         self.poll()
         self.update()
 
@@ -376,7 +460,7 @@ class Overlay(QWidget):
         bar = QRectF(PAD, 0, WIDTH - 2 * PAD, BAR_H)
         p.setFont(self.f_mono)
         p.setPen(QColor(255, 255, 255, 120))
-        p.drawText(bar, Qt.AlignLeft | Qt.AlignVCenter, "claude")
+        p.drawText(bar, Qt.AlignLeft | Qt.AlignVCenter, ", ".join(self.active_agents()))
         p.drawText(bar, Qt.AlignRight | Qt.AlignVCenter, "{%02d}" % len(self.sessions))
         y = BAR_H
         self.dashed_rule(p, y)
@@ -391,7 +475,11 @@ class Overlay(QWidget):
 
         y += GAP
         self.dashed_rule(p, y)
-        self.paint_limits(p, y + GAP)
+        y += GAP
+        blocks = self.limit_blocks()
+        for agent, lim in blocks:
+            self.paint_limits(p, y, lim, AGENT_COLORS[agent], tint=len(blocks) > 1)
+            y += 2 * LIMIT_H + GAP
 
     def dashed_rule(self, p, y):
         pen = QPen(QColor(255, 255, 255, 46), 1)
@@ -411,18 +499,26 @@ class Overlay(QWidget):
         state = s["state"]
         alert = self.alert_key(s) is not None
         color = COLORS.get(state, COLORS["idle"])
+        if state in ("working", "background"):
+            color = AGENT_COLORS.get(s.get("agent", "claude"), color)
         if self.hover == s["session_id"]:
             p.fillRect(r, QColor(255, 255, 255, 18))
 
         # Marker: a square that blinks hard, like a terminal cursor.
         if state == "working":
             lit = (time.time() % WORK_PERIOD) < WORK_PERIOD * 0.55
+        elif state == "background":
+            lit = (time.time() % BACKGROUND_PERIOD) < BACKGROUND_PERIOD * 0.55
         elif alert:
             lit = self.intensity(s["session_id"]) > 0.5
         else:
             lit = True
         m = QRectF(PAD, r.center().y() - MARK / 2, MARK, MARK)
-        if state == "done" and not alert:
+        if state == "background":
+            p.setPen(QPen(alpha(color, 230 if lit else 70), 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(m.adjusted(0.5, 0.5, -0.5, -0.5))
+        elif state == "done" and not alert:
             p.setPen(QPen(alpha(color, 200), 1))
             p.setBrush(Qt.NoBrush)
             p.drawRect(m.adjusted(0.5, 0.5, -0.5, -0.5))
@@ -438,12 +534,15 @@ class Overlay(QWidget):
         name = fit_words(QFontMetrics(font), s["_name"], WIDTH - PAD - left)
         p.drawText(QRectF(left, r.top(), WIDTH - PAD - left, r.height()), Qt.AlignLeft | Qt.AlignVCenter, name)
 
-    def paint_limits(self, p, y):
-        lim = self.limits or {}
+    def paint_limits(self, p, y, lim, fill, tint=False):
+        """One agent's 5h / 7d rows; with several blocks the labels take the agent's colour."""
+        lim = lim or {}
         now = time.time()
         fm = QFontMetrics(self.f_mono)
+        pct_w = fm.horizontalAdvance("100%")
+        when_w = fm.horizontalAdvance("Mon 00:00")
         x0 = PAD + fm.horizontalAdvance("5h") + 8
-        x1 = WIDTH - PAD - fm.horizontalAdvance("100%") - 8
+        x1 = WIDTH - PAD - pct_w - when_w - 14
         for i, (key, label) in enumerate((("five_hour", "5h"), ("seven_day", "7d"))):
             row = QRectF(PAD, y + i * LIMIT_H, WIDTH - 2 * PAD, LIMIT_H)
             win = lim.get(key) or {}
@@ -453,16 +552,21 @@ class Overlay(QWidget):
                 used = 0.0
 
             p.setFont(self.f_mono)
-            p.setPen(QColor(255, 255, 255, 140))
+            p.setPen(alpha(fill, 200) if tint else QColor(255, 255, 255, 140))
             p.drawText(row, Qt.AlignLeft | Qt.AlignVCenter, label)
             p.setPen(QColor(255, 255, 255, 220))
             p.drawText(row, Qt.AlignRight | Qt.AlignVCenter, "--" if used is None else f"{used:.0f}%")
+            # Reset time, dim, just left of the percentage: clock time for 5h, day + time for 7d.
+            if reset and reset > now:
+                when = time.strftime("%H:%M" if key == "five_hour" else "%a %H:%M", time.localtime(reset))
+                p.setPen(QColor(255, 255, 255, 95))
+                p.drawText(row.adjusted(0, 0, -(pct_w + 6), 0), Qt.AlignRight | Qt.AlignVCenter, when)
 
             track = QRectF(x0, row.center().y() - 1.5, x1 - x0, 3)
             p.fillRect(track, QColor(255, 255, 255, 34))
             if used:
                 frac = max(0.0, min(1.0, used / 100))
-                p.fillRect(QRectF(track.left(), track.top(), max(1.0, track.width() * frac), 3), BAR_FILL)
+                p.fillRect(QRectF(track.left(), track.top(), max(1.0, track.width() * frac), 3), fill)
 
 
 def single_instance():

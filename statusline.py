@@ -22,7 +22,7 @@ def window(raw):
 
 
 def main():
-    payload = json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}")
+    payload = json.loads(sys.stdin.buffer.read().decode("utf-8-sig") or "{}")
     limits = payload.get("rate_limits") or {}
     record = {
         "five_hour": window(limits.get("five_hour")),
@@ -36,7 +36,14 @@ def main():
     tmp = path + f".{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(record, f)
-    os.replace(tmp, path)
+    for attempt in range(5):  # the overlay may briefly hold the target open
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.05)
 
 
 def run():
