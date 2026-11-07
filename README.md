@@ -9,12 +9,12 @@ Works with **Claude Code**, **Antigravity CLI (agy)** and **OpenAI Codex CLI**.
 Open PowerShell and paste:
 
 ```powershell
-irm https://raw.githubusercontent.com/cdilekci/claude-monitor/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/cmdlkc/claude-monitor/main/install.ps1 | iex
 ```
 
 That downloads the latest release, installs it to `%LOCALAPPDATA%\Programs\Claude Monitor`, sets it to start at login and opens the overlay. Python is not needed. Claude Code sessions that are already open pick up the monitor after a restart (or `/hooks`).
 
-Or download `Claude-Monitor.zip` from [Releases](https://github.com/cdilekci/claude-monitor/releases), unzip it anywhere and run `Claude Monitor.exe`.
+Or download `Claude-Monitor.zip` from [Releases](https://github.com/cmdlkc/claude-monitor/releases), unzip it anywhere and run `Claude Monitor.exe`.
 
 ## What the squares mean
 
